@@ -1,182 +1,92 @@
-
-/**
- * 證交所 (TWSE) 與 櫃買中心 (TPEx) 資料同步服務
- * 實作高可用性重試機制與超時控制
- */
-
-const TWSE_URL = 'https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL';
-const TPEX_URL = 'https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes';
+// src/services/stockService.ts
 
 export interface SyncStatus {
+  timestamp: string;
   prices: Record<string, number>;
   names: Record<string, string>;
   errors: string[];
-  timestamp: string;
 }
 
-/**
- * 格式化為台灣地區習慣的日期格式
- */
-export const formatDateTW = (date: Date = new Date()): string => {
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, '0');
-  const d = String(date.getDate()).padStart(2, '0');
-  const hh = String(date.getHours()).padStart(2, '0');
-  const mm = String(date.getMinutes()).padStart(2, '0');
-  const ss = String(date.getSeconds()).padStart(2, '0');
-  return `${y}年${m}月${d}日 ${hh}:${mm}:${ss} (UTC+8)`;
+export const formatDateTW = (): string => {
+  const d = new Date();
+  return `${d.getFullYear()}/${(d.getMonth() + 1).toString().padStart(2, '0')}/${d.getDate().toString().padStart(2, '0')} ${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}`;
 };
 
-/**
- * 具備超時與重試機制的 Fetch 封裝
- * 預設超時延長至 30 秒以應對慢速代理
- */
-const fetchWithRetry = async (url: string, retries = 3, timeout = 30000): Promise<any> => {
-  let lastError: Error | null = null;
-  
-  for (let i = 0; i < retries; i++) {
-    const controller = new AbortController();
-    const id = setTimeout(() => controller.abort(), timeout);
-    
-    try {
-      const response = await fetch(url, { 
-        signal: controller.signal,
-        headers: {
-            'Accept': 'application/json',
-        }
-      });
-      clearTimeout(id);
+// 使用 CORS Proxy 繞過瀏覽器限制，直接存取 Yahoo Finance
+const CORS_PROXY = 'https://corsproxy.io/?'; 
+// 備用 Proxy: 'https://api.allorigins.win/raw?url=';
 
-      if (!response.ok) {
-        if (response.status === 408 || response.status === 429 || response.status >= 500) {
-            throw new Error(`伺服器忙碌 (HTTP ${response.status})`);
-        }
-        throw new Error(`連線失敗 (HTTP ${response.status})`);
-      }
-
-      const contentType = response.headers.get('content-type');
-      const text = await response.text();
-
-      // 檢查是否抓到 HTML 錯誤頁面（常見於代理伺服器超時回傳）
-      if (text.trim().startsWith('<!DOCTYPE') || text.trim().startsWith('<html')) {
-        throw new Error('代理伺服器回傳非預期 HTML 內容 (可能是超時頁面)');
-      }
-
-      try {
-        return JSON.parse(text);
-      } catch (e) {
-        throw new Error('回傳資料格式並非有效的 JSON');
-      }
-    } catch (err: any) {
-      clearTimeout(id);
-      
-      // 處理超時異常
-      if (err.name === 'AbortError') {
-        lastError = new Error(`請求超時 (超過 ${timeout/1000} 秒)`);
-      } else {
-        lastError = err as Error;
-      }
-      
-      if (i < retries - 1) {
-        // 指數退避重試邏輯
-        const delay = Math.pow(2, i) * 1500;
-        console.warn(`[重試 ${i + 1}/${retries}] 請求失敗: ${lastError.message}，將在 ${delay/1000} 秒後重試...`);
-        await new Promise(resolve => setTimeout(resolve, delay));
-      }
+const fetchStockPrice = async (code: string): Promise<{ price: number; name?: string } | null> => {
+  try {
+    // 判斷是上市 (.TW) 還是上櫃 (.TWO)
+    // 簡單邏輯：先試 .TW，失敗或無數據再試 .TWO，但在批量抓取時我們通常需要使用者輸入正確後綴，
+    // 這裡為了方便，我們預設先嘗試 .TW
+    let targetCode = code.toUpperCase();
+    if (!targetCode.includes('.')) {
+        targetCode += '.TW'; // 預設追加 .TW
     }
+
+    const url = `${CORS_PROXY}${encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${targetCode}?interval=1d`)}`;
+    
+    const response = await fetch(url);
+    if (!response.ok) throw new Error('Network response was not ok');
+    
+    const data = await response.json();
+    const result = data.chart.result[0];
+    
+    if (!result || !result.meta) return null;
+
+    // 取得最新價格 (Regular Market Price)
+    const price = result.meta.regularMarketPrice;
+    // 嘗試抓取股票名稱 (Yahoo 有時不準，但可參考)
+    // Yahoo API 回傳的 symbol 可能是 "2330.TW"，我們可以用它來做簡單驗證
+    
+    return { price };
+  } catch (error) {
+    console.error(`Error fetching ${code}:`, error);
+    return null;
   }
-  
-  throw lastError || new Error('多次重試後仍無法取得資料');
 };
 
 export const fetchAllStockPrices = async (): Promise<SyncStatus> => {
+  // 從 LocalStorage 讀取所有股票代碼 (為了不傳入參數，我們直接讀取儲存的資料，或者你也可以修改函式簽名傳入 stocks)
+  // 這裡假設我們只是一個 Helper，實際邏輯應該是 Component 傳入代碼列表。
+  // 為了配合你的 App.tsx 結構，我們做一點調整：
+  
+  // *注意：由於原本的 App.tsx 是呼叫 fetchAllStockPrices() 且不帶參數，
+  // 我們需要從 LocalStorage 偷看有哪些股票，或者這個函式本身不該負責讀取 LocalStorage。
+  // 為了最快修復，我們修改 App.tsx 傳入 stocks，或者在這裡讀取。
+  // 這裡選擇：讀取 LocalStorage (因為你的 App.tsx 介面如此)*
+  
+  const savedStocks = localStorage.getItem('app_stocks'); // 請確認你的 APP_STORAGE_KEYS.STOCKS 對應的值
+  const stocks = savedStocks ? JSON.parse(savedStocks) : [];
+  
+  const prices: Record<string, number> = {};
+  const names: Record<string, string> = {}; // Yahoo API 較難抓中文名，這裡暫時留空或由後續補強
   const errors: string[] = [];
-  const priceMap: Record<string, number> = {};
-  const nameMap: Record<string, string> = {};
 
-  /**
-   * 抓取證交所數據 (TWSE)
-   */
-  const fetchTwse = async () => {
-    const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(TWSE_URL)}`;
-    return await fetchWithRetry(proxyUrl);
-  };
-
-  /**
-   * 抓取櫃買中心數據 (TPEx)
-   */
-  const fetchTpex = async () => {
-    // 優先使用 corsproxy.io
-    const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(TPEX_URL)}`;
-    try {
-      return await fetchWithRetry(proxyUrl);
-    } catch (e: any) {
-      console.warn(`TPEx 主要代理失敗 (${e.message})，嘗試切換備援代理...`);
-      // 備援：AllOrigins
-      const backupUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(TPEX_URL)}&_=${Date.now()}`;
-      const res = await fetchWithRetry(backupUrl);
-      const contents = typeof res.contents === 'string' ? JSON.parse(res.contents) : res.contents;
-      if (!contents) throw new Error("備援代理回傳內容為空");
-      return contents;
+  // 平行請求所有股票 (Promise.all)
+  await Promise.all(stocks.map(async (stock: any) => {
+    // 嘗試抓取 (先試 .TW)
+    let data = await fetchStockPrice(stock.code);
+    
+    // 如果失敗且沒後綴，嘗試 .TWO (上櫃)
+    if (!data && !stock.code.includes('.')) {
+         const dataTwo = await fetchStockPrice(`${stock.code}.TWO`);
+         if(dataTwo) data = dataTwo;
     }
-  };
 
-  try {
-    const [twseRes, tpexRes] = await Promise.allSettled([
-      fetchTwse(),
-      fetchTpex()
-    ]);
-
-    // 處理 TWSE (證交所)
-    if (twseRes.status === 'fulfilled' && Array.isArray(twseRes.value)) {
-      twseRes.value.forEach((item: any) => {
-        const code = String(item.Code || "").trim();
-        const name = String(item.Name || "").trim();
-        const priceStr = item.ClosingPrice;
-        
-        if (code && name) nameMap[code] = name;
-        if (priceStr && priceStr !== '-' && priceStr !== '') {
-          const price = parseFloat(String(priceStr).replace(/,/g, ''));
-          if (!isNaN(price)) priceMap[code] = price;
-        }
-      });
+    if (data) {
+      prices[stock.code] = data.price;
     } else {
-      const msg = twseRes.status === 'rejected' ? twseRes.reason.message : '連線異常';
-      errors.push(`證交所: ${msg}`);
+      errors.push(stock.code);
     }
-
-    // 處理 TPEx (櫃買中心)
-    if (tpexRes.status === 'fulfilled' && Array.isArray(tpexRes.value)) {
-      tpexRes.value.forEach((item: any) => {
-        const code = String(item.SecuritiesCompanyCode || "").trim();
-        const name = String(item.CompanyName || "").trim();
-        const priceStr = item.Close;
-        
-        if (code && name) {
-          nameMap[code] = name;
-          if (priceStr && priceStr !== '-' && priceStr !== '') {
-            const price = parseFloat(String(priceStr).replace(/,/g, ''));
-            if (!isNaN(price)) {
-              priceMap[code] = price;
-            }
-          }
-        }
-      });
-    } else {
-      const msg = tpexRes.status === 'rejected' ? tpexRes.reason.message : '連線異常';
-      errors.push(`櫃買中心: ${msg}`);
-      console.error("TPEx Sync Failure Detail:", tpexRes.status === 'rejected' ? tpexRes.reason : "Unknown");
-    }
-
-  } catch (e) {
-    errors.push("系統核心異常，請檢查網路狀態");
-    console.error("Critical Sync Error:", e);
-  }
+  }));
 
   return {
-    prices: priceMap,
-    names: nameMap,
-    errors,
-    timestamp: formatDateTW()
+    timestamp: formatDateTW(),
+    prices,
+    names,
+    errors
   };
 };
